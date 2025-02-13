@@ -1,0 +1,10 @@
+venv/*
+data/*.gz
+data/*.urls-kp
+data/*.parquet
+data/*.html
+data/*.idx
+*.csv
+tmp/*
+*.idx
+cluster.idx
