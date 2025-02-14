@@ -12,7 +12,7 @@ from requests import RequestException, HTTPError, Timeout, ConnectionError
 from requests.sessions import Session
 from sqlalchemy import create_engine
 
-from config import CACHE_REQUESTS, CH_CONNECT_URI
+from config import CACHE_REQUESTS, DB_CONNECT_URI
 
 
 logger = logging.getLogger(__name__)
@@ -64,7 +64,7 @@ tz_utz = timezone('UTC')
 
 # create Clickhouse SQLAlchemy engine
 def make_engine(echo=False, pool_size=100, max_overflow=100):
-    return create_engine(url=CH_CONNECT_URI,
+    return create_engine(url=DB_CONNECT_URI,
                          echo=False,
                          pool_size=pool_size,
                          max_overflow=max_overflow)
@@ -89,14 +89,21 @@ def ensure(d: dict, keys: Union[str, Iterable[str]], default=None):
             d[key] = default
 
 
+RPT_KIND_BACKOFF = 'Backing off'
+RPT_KIND_SUCCESS = 'Success'
+RPT_KIND_GIVEUP = 'Gave up'
+
 def backoff_reporting(kind: str, details: dict):
     ensure(details, 'kind', kind)
-    ensure(details, ('elapsed', 'exception', 'tries', 'value', 'wait', 'target'))
-    logger.warning("{kind} {wait}s after {tries} tries "
-                   "due to {exception}; func {target}, args: {args},"
-                   "kwargs: {kwargs}, elapsed {elapsed}"
-                   "wait: {wait}, value: {value}".format(**details))
+    ensure(details, ('elapsed', 'exception', 'tries',
+                     'value', 'wait', 'target'))
+    if not (kind == RPT_KIND_SUCCESS and details['tries'] < 2):
+        logger.warning(
+            "{kind} {wait}s after {tries} tries "
+            "due to {exception}; func {target}, args: {args},"
+            "kwargs: {kwargs}, elapsed {elapsed}"
+            "wait: {wait}, value: {value}".format(**details))
 
-on_backoff_rpt = partial(backoff_reporting, 'Backing off')
-on_success_rpt = partial(backoff_reporting, 'Success')
-on_giveup_rpt = partial(backoff_reporting, 'Gave up')
+on_backoff_rpt = partial(backoff_reporting, RPT_KIND_BACKOFF)
+on_success_rpt = partial(backoff_reporting, RPT_KIND_SUCCESS)
+on_giveup_rpt = partial(backoff_reporting, RPT_KIND_GIVEUP)

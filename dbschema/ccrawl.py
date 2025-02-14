@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import List
 
-from clickhouse_sqlalchemy import make_session, types
+# from clickhouse_sqlalchemy import make_session, types
 from sqlalchemy import ForeignKey, func, Index, Boolean
 from sqlalchemy import Integer, String, DateTime, VARCHAR
 from sqlalchemy.orm import Mapped
@@ -16,6 +16,9 @@ from config import (CC_DATA_HOSTNAME, TABLE_ARGS_Crawl,
                     TABLE_DEFAULTS_CdxFirstUrl,
                     TABLE_DEFAULTS_WebTextEmbeddings,
                     TABLE_DEFAULTS_WarcRecord)
+from config import (COL_SMALLINT, COL_INTEGER, COL_BIGINT, COL_FLOAT,
+                    COL_TIMESTAMP, COL_STRING, COL_TEXT, COL_BOOLEAN,
+                    COL_JSON, COL_ARRAY, COL_ENUM)
 
 import pudb
 
@@ -25,27 +28,28 @@ class Crawl(Base):
 
     """ Crawl identity: the label is the 'CC-MAIN-YYY-WW' part of the URL"""
     id: Mapped[int] = mapped_column(
-        types.UInt32, primary_key=True, server_default=func.rand64())
-    label: Mapped[str] = mapped_column(String(15))
-    url: Mapped[str]
+        COL_BIGINT, primary_key=True,
+        server_default=func.floor(2**32 * func.random()))
+    label: Mapped[str] = mapped_column(COL_STRING(20))
+    url: Mapped[str] = mapped_column(VARCHAR(512))
     created: Mapped[datetime] = mapped_column(DateTime(timezone=tz_utz),
                                               server_default=func.now())
 
     @classmethod
     def get(cls, label=None, crawl_id=None):
         # Break out shortened column names
-        label_, crawl_id_ = cls.__table__.c.label, cls.__table__.c.id
+        c = cls.__table__.c
         with sa_session() as sa:
             if label:
                 res = (sa.execute(select('*')
                                    .select_from(cls)
-                                   .where(label_ == label)
+                                   .where(c.label == label)
                                    .limit(1))
                        .mappings().first())
             elif crawl_id:
                 res = (sa.execute(select('*')
                                    .select_from(cls)
-                                   .where(crawl_id_ == crawl_id)
+                                   .where(c.crawl_id == crawl_id)
                                    .limit(1))
                        .mappings().first())
             else:
@@ -74,6 +78,8 @@ class Crawl(Base):
                 f"url={self.url!r}, "
                 f"created={self.created!r}")
 
+    __str__ = __repr__
+
 
 class CdxFirstUrl(Base):
     __tablename__ = "cdx_start_url"
@@ -82,8 +88,8 @@ class CdxFirstUrl(Base):
     """ CdxFirstUrl: contains the first URL in a CC cdx index file, and this
         table serves as a binary-searchable index to locate the cdx file
         in which a domain's URLs are stored."""
-    id: Mapped[int] = mapped_column(types.UInt64, primary_key=True,
-                                    server_default=func.rand64())
+    id: Mapped[int] = mapped_column(COL_BIGINT, primary_key=True,
+                                    server_default=func.floor(2**63 * func.random()))
     crawl_id: Mapped[int] = mapped_column(ForeignKey("crawl.id"),
                                           nullable=False)
     cdx_num: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -92,7 +98,7 @@ class CdxFirstUrl(Base):
     subdomain: Mapped[str] = mapped_column(VARCHAR(128),
                                            nullable=False)
     path: Mapped[str] = mapped_column(VARCHAR(255), nullable=False)
-    timestamp: Mapped[datetime] = mapped_column(types.DateTime,
+    timestamp: Mapped[datetime] = mapped_column(COL_TIMESTAMP,
                                                 nullable=False)
     headers: Mapped[str] = mapped_column(VARCHAR(511), nullable=False)
     created: Mapped[datetime] = mapped_column(DateTime(timezone=tz_utz),
@@ -144,6 +150,12 @@ class CdxFirstUrl(Base):
             return (sa.query(cls)
                       .filter_by(crawl_id=urls[0].crawl_id)
                       .count())
+
+    @classmethod
+    def all(cls):
+        with sa_session() as sa:
+            for row in sa.query(cls).all():
+                yield row
 
     @classmethod
     def find_domain_cdxes(cls, crawl_id: int, url: UrlPattern):
@@ -213,11 +225,11 @@ class WebTextEmbeddings(Base):
 
     """ WebTextEmbeddings: stores the URL, metadata, and LMM embedding 
         of a web page"""
-    id: Mapped[int] = mapped_column(types.UInt64, primary_key=True,
-                                    server_default=func.rand64())
+    id: Mapped[int] = mapped_column(COL_BIGINT, primary_key=True,
+                                    server_default=func.floor(2**63 * func.random()))
     url: Mapped[str] = mapped_column(VARCHAR(255), nullable=False)
     page_metadata: Mapped[str] = mapped_column(String(255))
-    embedding: Mapped[List[float]] = mapped_column(types.Array(types.Float32))
+    embedding: Mapped[List[float]] = mapped_column(COL_ARRAY(COL_FLOAT))
     created: Mapped[datetime] = mapped_column(DateTime(timezone=tz_utz),
                                               server_default=func.now())
 
@@ -232,13 +244,15 @@ class WebTextEmbeddings(Base):
                 f"metadata={self.metadata!r}, "
                 f"created={self.created!r})")
 
+    __str__ = __repr__
+
 
 class KnownUrlPatterns(Base):
     __tablename__ = "known_url_patterns"
 
     """ KnownUrlPatterns: stores the URL patterns of known web pages"""
-    id: Mapped[int] = mapped_column(types.UInt64, primary_key=True,
-                                    server_default=func.rand64())
+    id: Mapped[int] = mapped_column(COL_BIGINT, primary_key=True,
+                                    server_default=func.floor(2**63 * func.random()))
     crawl_id: Mapped[int] = mapped_column(ForeignKey("crawl.id"),
                                           nullable=False)
     url: Mapped[str] = mapped_column(VARCHAR(255), nullable=False)
@@ -254,14 +268,16 @@ class KnownUrlPatterns(Base):
                 f"pattern={self.pattern!r}, "
                 f"created={self.created!r})")
 
+    __str__ = __repr__
+
 class WarcResource(Base):
     __tablename__ = "warc_record"
     __table_args__ = TABLE_DEFAULTS_WarcRecord
 
     """ WarcResource: stores the URL, metadata, and LMM embedding 
         of a web page"""
-    id: Mapped[int] = mapped_column(types.UInt64, primary_key=True,
-                                    server_default=func.rand64())
+    id: Mapped[int] = mapped_column(COL_BIGINT, primary_key=True,
+                                    server_default=func.floor(2**63 * func.random()))
     crawl_id: Mapped[int] = mapped_column(ForeignKey("crawl.id"))
     page_url: Mapped[str] = mapped_column(VARCHAR(255), nullable=False)
     warc_url: Mapped[str] = mapped_column(VARCHAR(255), nullable=False)
@@ -298,6 +314,8 @@ class WarcResource(Base):
                 f"warc_url={self.warc_url!r}, "
                 f"metadata={self.metadata!r}, "
                 f"created={self.created!r})")
+
+    __str__ = __repr__
 
 
 if __name__ == "__main__":
