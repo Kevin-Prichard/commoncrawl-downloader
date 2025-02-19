@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 from datetime import datetime
-from typing import List
+import json
+import logging
+from typing import List, Mapping
 
 # from clickhouse_sqlalchemy import make_session, types
 from sqlalchemy import ForeignKey, func, Index, Boolean
@@ -20,6 +22,8 @@ from config import (COL_SMALLINT, COL_INTEGER, COL_BIGINT, COL_FLOAT,
                     COL_TIMESTAMP, COL_STRING, COL_TEXT, COL_BOOLEAN,
                     COL_JSON, COL_ARRAY, COL_ENUM)
 
+logger = logging.getLogger(__name__)
+
 import pudb
 
 class Crawl(Base):
@@ -31,7 +35,7 @@ class Crawl(Base):
         COL_BIGINT, primary_key=True,
         server_default=func.floor(2**32 * func.random()))
     label: Mapped[str] = mapped_column(COL_STRING(20))
-    url: Mapped[str] = mapped_column(VARCHAR(512))
+    url: Mapped[str] = mapped_column(COL_TEXT())
     created: Mapped[datetime] = mapped_column(DateTime(timezone=tz_utz),
                                               server_default=func.now())
 
@@ -49,24 +53,24 @@ class Crawl(Base):
             elif crawl_id:
                 res = (sa.execute(select('*')
                                    .select_from(cls)
-                                   .where(c.crawl_id == crawl_id)
+                                   .where(c.id == crawl_id)
                                    .limit(1))
                        .mappings().first())
             else:
-                raise ValueError("Must provide either label or crawl_id")
+                raise ValueError("Must provide either label or crawl")
         if res:
             return cls(**res)
         return None
 
     @classmethod
-    def exists(cls, label):
-        return cls.get(label=label)
+    def exists(cls, label) -> bool:
+        return cls.get(label=label) is not None
 
     @classmethod
     def add(cls, label, url):
         with sa_session() as sa:
             sa.execute(cls.__table__.insert(),
-                                 {"label": label, "url": url})
+                       {"label": label, "url": url})
             sa.commit()
             return (sa.query(cls)
                               .filter_by(label=label, url=url)
@@ -94,19 +98,19 @@ class CdxFirstUrl(Base):
                                           nullable=False)
     cdx_num: Mapped[int] = mapped_column(Integer, nullable=False)
     tld: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
-    domain: Mapped[str] = mapped_column(VARCHAR(128), nullable=False)
-    subdomain: Mapped[str] = mapped_column(VARCHAR(128),
+    domain: Mapped[str] = mapped_column(COL_TEXT(), nullable=False)
+    subdomain: Mapped[str] = mapped_column(COL_TEXT(),
                                            nullable=False)
-    path: Mapped[str] = mapped_column(VARCHAR(255), nullable=False)
+    path: Mapped[str] = mapped_column(COL_TEXT(), nullable=False)
     timestamp: Mapped[datetime] = mapped_column(COL_TIMESTAMP,
                                                 nullable=False)
-    headers: Mapped[str] = mapped_column(VARCHAR(511), nullable=False)
+    headers: Mapped[str] = mapped_column(COL_TEXT(), nullable=False)
     created: Mapped[datetime] = mapped_column(DateTime(timezone=tz_utz),
                                               server_default=func.now())
 
     def __repr__(self) -> str:
         return (f"CdxFirstUrl=({self.id!r}, "
-                f"crawl_id={self.crawl_id!r}, "
+                f"crawl={self.crawl_id!r}, "
                 f"cdx_num={self.cdx_num!r}, "
                 f"tld={self.tld!r}, "
                 f"domain={self.domain!r}, "
@@ -161,8 +165,7 @@ class CdxFirstUrl(Base):
     def find_domain_cdxes(cls, crawl_id: int, url: UrlPattern):
         # Break out for shortened column names
         c = CdxFirstUrl.__table__.c
-        with sa_session() as sa:
-
+        with (sa_session() as sa):
             # First cdx number likely to contain the TLD
             tld_cdx0 = sa.execute(
                 select(c.crawl_id, c.cdx_num, c.tld, c.domain)
@@ -171,7 +174,11 @@ class CdxFirstUrl(Base):
                                 c.tld < url.tld))
                     .order_by(c.tld.desc(), c.domain.desc())
                     .limit(1)
-            ).first().cdx_num
+            ).first()
+            if not tld_cdx0:
+                logger.warning("Could not find tld .%s for tld_cdx0", url.tld)
+                return None
+            tld_cdx0 = tld_cdx0.cdx_num
 
             # Last cdx number likely to contain the TLD
             tld_cdx1 = sa.execute(
@@ -181,7 +188,11 @@ class CdxFirstUrl(Base):
                                 c.tld == url.tld))
                     .order_by(c.tld.desc(), c.domain.desc())
                     .limit(1)
-            ).first().cdx_num
+            ).first()
+            if not tld_cdx1:
+                logger.warning("Could not find tld .%s for tld_cdx1", url.tld)
+                return None
+            tld_cdx1 = tld_cdx1.cdx_num
 
             # First cdx number likely to contain the domain
             dom_cdx0 = sa.execute(
@@ -193,7 +204,11 @@ class CdxFirstUrl(Base):
                                 c.cdx_num <= tld_cdx1))
                     .order_by(c.tld.desc(), c.domain.desc())
                     .limit(1)
-            ).first().cdx_num
+            ).first()
+            if not dom_cdx0:
+                logger.warning("Could not find tld .%s for dom_cdx0", url.domain)
+                return None
+            dom_cdx0 = dom_cdx0.cdx_num
 
             # Last cdx number AFTER the cdx likely to contain the domain
             dom_cdx1 = sa.execute(
@@ -206,7 +221,11 @@ class CdxFirstUrl(Base):
                                 c.cdx_num <= tld_cdx1))
                     .order_by(c.tld.asc(), c.domain.asc())
                     .limit(1)
-            ).first().cdx_num
+            ).first()
+            if not dom_cdx1:
+                logger.warning("Could not find tld .%s for dom_cdx1", url.domain)
+                return None
+            dom_cdx1 = dom_cdx1.cdx_num
 
             # Now we know the range of cdx numbers to return, do so
             results = sa.execute(
@@ -233,7 +252,7 @@ class WebTextEmbeddings(Base):
     created: Mapped[datetime] = mapped_column(DateTime(timezone=tz_utz),
                                               server_default=func.now())
 
-    def exists(self, session):
+    def exists(self):
         with sa_session() as sa:
             return bool(sa.query(WebTextEmbeddings)
                                     .filter_by(url=self.url)
@@ -255,7 +274,7 @@ class KnownUrlPatterns(Base):
                                     server_default=func.floor(2**63 * func.random()))
     crawl_id: Mapped[int] = mapped_column(ForeignKey("crawl.id"),
                                           nullable=False)
-    url: Mapped[str] = mapped_column(VARCHAR(255), nullable=False)
+    url: Mapped[str] = mapped_column(COL_TEXT(), nullable=False)
     pattern: Mapped[str] = mapped_column(VARCHAR(255), nullable=False)
     warc_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     warc_completed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -279,9 +298,9 @@ class WarcResource(Base):
     id: Mapped[int] = mapped_column(COL_BIGINT, primary_key=True,
                                     server_default=func.floor(2**63 * func.random()))
     crawl_id: Mapped[int] = mapped_column(ForeignKey("crawl.id"))
-    page_url: Mapped[str] = mapped_column(VARCHAR(255), nullable=False)
-    warc_url: Mapped[str] = mapped_column(VARCHAR(255), nullable=False)
-    page_metadata: Mapped[str] = mapped_column(VARCHAR(511))
+    page_url: Mapped[str] = mapped_column(COL_TEXT(), nullable=False)
+    warc_url: Mapped[str] = mapped_column(COL_TEXT(), nullable=False)
+    page_metadata: Mapped[str] = mapped_column(COL_TEXT())
     page_length: Mapped[int] = mapped_column(Integer, nullable=False)
     warc_length: Mapped[int] = mapped_column(Integer, nullable=False)
     # embedding: Mapped[List[float]] = mapped_column(types.Array(types.Float32))
@@ -289,16 +308,16 @@ class WarcResource(Base):
                                               server_default=func.now())
 
     @classmethod
-    def add(cls, crawl: Crawl, page_url, warc_url, metadata, length) -> None:
+    def add(cls, crawl: Crawl, page_url, warc_url, page_metadata, length) -> None:
         with sa_session() as sa:
             sa.execute(cls.__table__.insert(),
                        {"crawl_id": crawl.id,
                         "page_url": page_url,
                         "warc_url": warc_url,
-                        "metadata": metadata,
-                        "page_length": int(metadata["length"]),
+                        "page_metadata": page_metadata,
+                        "page_length": int(json.loads(page_metadata)["length"]),
                         "warc_length": length})
-            print("Added ", page_url, "***", warc_url, "*", metadata, "*", length)
+            print("Added ", page_url, "***", warc_url, "*", page_metadata, "*", length)
             sa.commit()
 
     @classmethod
@@ -317,6 +336,34 @@ class WarcResource(Base):
 
     __str__ = __repr__
 
+
+# Neither postgres nor psycopg2 automatically truncate overlength strings
+# So we need to do it ourselves. See also ccdownloader.truncate_overlength.
+"""
+def truncate_overlength(rec: Base, lengths: Mapping[str, tuple[str, Base]]):
+    pu.db
+    for fld, length in lengths:
+        if len(val := getattr(rec, fld)) > length:
+            setattr(rec, fld, val[:length])
+
+
+CRAWL_FLD_MAX = [
+    ('url', Crawl.url.property.columns[0].type.length),
+    ('label', Crawl.label.property.columns[0].type.length),
+]
+CDX_FLD_MAX = [
+    ('tld', CdxFirstUrl.tld.property.columns[0].type.length),
+    ('domain', CdxFirstUrl.domain.property.columns[0].type.length),
+    ('subdomain', CdxFirstUrl.subdomain.property.columns[0].type.length),
+    ('path', CdxFirstUrl.path.property.columns[0].type.length),
+    ('headers', CdxFirstUrl.headers.property.columns[0].type.length),
+]
+WARC_FLD_MAX = [
+    ('page_url', WarcResource.page_url.property.columns[0].type.length),
+    ('warc_url', WarcResource.warc_url.property.columns[0].type.length),
+    ('page_metadata', WarcResource.page_metadata.property.columns[0].type.length),
+]
+"""
 
 if __name__ == "__main__":
     engine = make_engine(echo=True)

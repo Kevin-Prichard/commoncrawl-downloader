@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import time
+
 from abc import ABC, abstractmethod
 from collections import defaultdict as dd
 import gzip
@@ -8,31 +8,34 @@ import os
 import re
 from datetime import datetime
 import logging
+import sys
 from typing import Set, List, Union, Text, Generator, Mapping
 from urllib.parse import urlsplit
 
 import backoff
-import dramatiq
-from dramatiq import pipeline
-from dramatiq.brokers.redis import RedisBroker
 import httpx
-from dramatiq.results import Results
-from dramatiq.results.backends.redis import RedisBackend
-from requests_cache import CachedSession
 
-from common import (BACKOFF_EXCEPTIONS, BACKOFF_MAX_TIME, BACKOFF_MAX_TRIES)
-from common import (on_backoff_rpt, on_success_rpt, on_giveup_rpt)
-from common import (CC_TIMESTAMP_STRPTIME, CDX_RX,
-                    CDX_TO_URLPATTERN, requests_session, UrlPattern)
-from config import CC_DATA_HOSTNAME
-from dbschema.ccrawl import (Crawl, CdxFirstUrl, WarcResource)
-from gzip_partial import get_gz_resource
-from simple_requests_cache import SimpleRequestsCache
-
+# import dramatiq
+# from dramatiq import pipeline
+# from dramatiq.brokers.redis import RedisBroker
+# from dramatiq.results import Results
+# from dramatiq.results.backends.redis import RedisBackend
 # redis_broker = RedisBroker(host="localhost")
 # result_backend = RedisBackend(host="localhost")
 # redis_broker.add_middleware(Results(backend=result_backend))
 # dramatiq.set_broker(redis_broker)
+
+from requests_cache import CachedSession
+
+from common_requests import (requests_session, HTTP_BACKOFF_EXCEPTIONS,
+                             BACKOFF_MAX_TIME, BACKOFF_MAX_TRIES,
+                             on_backoff_rpt, on_success_rpt, on_giveup_rpt)
+from common import (CC_TIMESTAMP_STRPTIME, CDX_RX,
+                    CDX_TO_URLPATTERN, UrlPattern)
+from config import CC_DATA_HOSTNAME
+from dbschema.ccrawl import (Base, Crawl, CdxFirstUrl, WarcResource)
+from gzip_partial import get_gz_resource
+from simple_requests_cache import SimpleRequestsCache
 
 req_session = CachedSession('demo_cache')
 logger = logging.getLogger(__name__)
@@ -41,11 +44,10 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:100.0) "
               "Gecko/100.0 Firefox/100.0 (I'm the Browser You Deserve, "
               "Not the One You Want)")
 
-
 def blank_none(val):
     return "" if val is None else val
 
-URL_SCAN_BLOCKSIZE = 2**16
+URL_SCAN_BLOCKSIZE = 2**20 * 2
 NEWLINE_BYTES = b"\n"
 NEWLINE_STR = r"\n"
 LINE_SPLITTER_BYTES = re.compile(b"(" + NEWLINE_BYTES + b")")
@@ -56,12 +58,11 @@ LINE_SPLITTER = LINE_SPLITTER_STR
 
 OBSERVER_FIELDS = ['tld', 'domain', 'subdomain', 'timestamp']
 
-
 class CCIndexOfCrawls:
     def __init__(self, user_agent: str):
         self.user_agent = user_agent
 
-    @backoff.on_exception(backoff.expo, BACKOFF_EXCEPTIONS,
+    @backoff.on_exception(backoff.expo, HTTP_BACKOFF_EXCEPTIONS,
                           max_time=BACKOFF_MAX_TIME,
                           max_tries=BACKOFF_MAX_TRIES,
                           on_success=on_success_rpt,
@@ -73,7 +74,6 @@ class CCIndexOfCrawls:
             headers={"user_agent": self.user_agent}
         ).json()
         return {crawl['id']: crawl for crawl in crawl_index}
-
 
 class CCIndexStatusObserver(ABC):
     @abstractmethod
@@ -96,7 +96,6 @@ class CCIndexStatusObserver(ABC):
             None
         """
         pass
-
 
 class CCIndexBuilder:
     MAX_CDX_LENGTH_COMPRESSED = 2000
@@ -145,7 +144,7 @@ class CCIndexBuilder:
         website within an entire CommonCrawl dataset.
 
         Args:
-            label: Common Crawl index to fetch
+            self.label: Common Crawl index to fetch
         Returns:
             List[str]: The first row of each index file for the dataset
         """
@@ -157,7 +156,6 @@ class CCIndexBuilder:
             user_agent=self.user_agent,
             requests_session=requests_session)
 
-        # 1.1 Listify the URLs
         cdx_urls = list(filter(lambda url: CDX_RX.match(url),
                                cc_idx.strip().split('\n')))
         url_count = len(cdx_urls)
@@ -168,8 +166,6 @@ class CCIndexBuilder:
     def _get_cdx_first_rows(self,
                             crawl: Crawl,
                             cdx_urls: List[str]) -> [List[CdxFirstUrl], int]:
-        # Fetch the first row of each index file, providing generous length
-        # to ensure that the entire first row is included without error
         cdx_first_rows = []
         url_count = len(cdx_urls)
 
@@ -196,7 +192,7 @@ class CCIndexBuilder:
                 logger.warning(f"No records found in {cdx_url}")
             rec = CDX_TO_URLPATTERN.match(cdx_lines[0])
             if not rec:
-                pu.db
+                continue
             rec = rec.groupdict()
             rec.update({'timestamp': datetime.strptime(rec['timestamp'],
                                                        CC_TIMESTAMP_STRPTIME),
@@ -204,6 +200,7 @@ class CCIndexBuilder:
                         'cdx_num': int(cdx_file_num),
                         'created': self._start_timestamp,
             })
+
             url_record = CdxFirstUrl(**rec)
             logger.debug("cdx first row %s from %s",
                          url_record, cdx_url_frag)
@@ -212,7 +209,6 @@ class CCIndexBuilder:
         return cdx_first_rows, url_count
 
     def _save_cdx_first_rows(self):
-        # if not Crawl.exists(self.label):
         added_count = CdxFirstUrl.add_batch(self.cdx_first_rows)
         logger.info("Added %d CdxFirstUrl records", added_count)
 
@@ -221,20 +217,6 @@ class CCIndexBuilder:
         if self._observer:
             self._observer(self.label, status_msg, index_complete,
                            indices_done, indices_total)
-
-    """
-    @staticmethod
-    def pull_cdx_files(urls: Union[UrlPattern, List[UrlPattern]]) -> List[str]:
-        found_cdxes = []
-        urls = [urls] if isinstance(urls, UrlPattern) else urls
-        for url in urls:
-            found_cdxes.extend(CdxFirstUrl.find_domain_cdxes(url))
-        cdx_urls = set(cdx.to_cdx_url() for cdx in found_cdxes)
-        for cdx_url in cdx_urls:
-            print(cdx_url)
-        return found_cdxes
-    """
-
 
 class CCPageLocatorProgressObserver(ABC):
     @abstractmethod
@@ -262,7 +244,6 @@ class CCPageLocatorProgressObserver(ABC):
         """
         pass
 
-
 class CCPageLocatorPageObserver(ABC):
     @abstractmethod
     def __call__(self, page_info: Mapping) -> None:
@@ -279,7 +260,6 @@ class CCPageLocatorPageObserver(ABC):
         """
         pass
 
-
 class CCPageLocator:
     def __init__(self, crawl_label: str,
                  url_patterns: List[UrlPattern],
@@ -289,7 +269,7 @@ class CCPageLocator:
                  force_update: bool = False,
                  ):
         self.crawl_label = crawl_label
-        self.crawl_id = Crawl.get(crawl_label).id
+        self.crawl = Crawl.get(crawl_label)
         self.url_patterns = url_patterns
         self.url_encoding = url_encoding
         self.progress_observer = progress_observer
@@ -301,10 +281,10 @@ class CCPageLocator:
         self._send_progress(None, "Searching for CDXes",
                             False, None)
         cdx_count = 0
-        existing_cdx_count = CdxFirstUrl.count(self.crawl_id)
-        if self.force_update or existing_cdx_count == 0:
-            self.cdxes = self._find_cdxes()
-            cdx_count = len(self.cdxes)
+        existing_cdx_count = CdxFirstUrl.count(self.crawl)
+        # if self.force_update or existing_cdx_count == 0:
+        self.cdxes = self._find_cdxes()
+        cdx_count = len(self.cdxes)
 
         if cdx_count and not existing_cdx_count:
             msg = f"Found {cdx_count} new CDXes"
@@ -329,10 +309,11 @@ class CCPageLocator:
         """
         cdxes = set()
         for url in self.url_patterns:
-            cdxes.update(CdxFirstUrl.find_domain_cdxes(
-                self.crawl_id,
+            if adding_cdxes := CdxFirstUrl.find_domain_cdxes(
+                self.crawl.id,
                 url
-            ))
+            ):
+                cdxes.update(adding_cdxes)
         return list(cdxes)
 
     def url_patterns_to_regex(self,
@@ -348,14 +329,15 @@ class CCPageLocator:
         for field in UrlPattern._fields:
             eles[field] = sorted(set(blank_none(getattr(url, field))
                                      for url in self.url_patterns))
-        regex = (f"(?P<tld>{'|'.join(eles['tld'])})," +
+        regex = (f"^(?P<tld>{'|'.join(eles['tld'])})," +
                  f"(?P<domain>{'|'.join(eles['domain'])}),?" +
-                 (f"(?P<subdomain>{'|'.join(eles['subdomain'])})\)" if eles[
-                     'subdomain'] else "") +
-                 (f"(?P<path>/?{'|'.join(eles['path'])}.*)" if eles[
-                     'path'] else ".*") +
-                 "\s+(?P<timestamp>\d+).*?" +
-                 "\s+(?P<headers>\{.*\})$")
+                 (f"(?P<subdomain>{'|'.join(eles['subdomain'])})" if eles[
+                     'subdomain'] else "(?P<subdomain>[^)]*)") +
+                 r"\)" +
+                 (f"(?P<path>/?{'|'.join(eles['path'])}.*?)" if eles[
+                     'path'] else "(?P<path>.*?)") +
+                 r"\s+(?P<timestamp>\d{14})\s+" +
+                 r"(?P<headers>{.+}?)$")
         if encoding:
             return re.compile(regex.encode(encoding), re.IGNORECASE)
         return re.compile(regex, re.IGNORECASE)
@@ -377,66 +359,93 @@ class CCPageLocator:
                                    headers={'accept-encoding': 'gzip'}
                                    )
             elif isinstance(cdx, CdxFirstUrl):
-                # pu.db
                 stream = SimpleRequestsCache(
                     "cache",
                     cdx.to_cdx_url(),
+                    block_size = URL_SCAN_BLOCKSIZE,
                     stream=True,
                     headers={'accept-encoding': 'gzip'})
-
-                """
-                response = requests.get(
-                    cdx.to_cdx_url(), stream=True,
-                    headers={'accept-encoding': 'gzip'})
-                stream_len = int(response.headers.get('content-length'))
-                stream = response.raw
-                """
 
             if stream is None:
                 raise ValueError(f"Invalid type {type(cdx)} for cdx")
 
+            def gzip_reader(gstream, block_size):
+                gunzip_done = False
+                while not gunzip_done:
+                    try:
+                        block = gstream.read(block_size)
+                        gunzip_done = gstream.fileobj.tell() >= gstream.fileobj.length()
+                    except StopIteration:
+                        break
+                    except (Exception, RuntimeError, EOFError) as e:
+                        block = gstream.read()
+                        gunzip_done = True
+                    except:
+                        logger.warning(
+                            "Unexpected error: %s", sys.exc_info()[0])
+                    yield block
+
             last_pct = 0.0
-            with gzip.GzipFile(fileobj=stream, mode="rb") as gunzipped:
-                partial = None
-                skip = 0
-                self._send_progress(None, "Starting CDX scan of %s" % cdx,
-                                    False, 0.0)
-                for block in iter(lambda: gunzipped.read(2 ** 22), b''):
-                    if (new_pct := int(stream.tell() / stream.length() * 100)) > last_pct:
-                        last_pct = new_pct
-                        self._send_progress(cdx, "Scanning CDX",
-                                            False, last_pct)
-                    if not block:
-                        print("empty block ", "*" * 80)
-                    parts = LINE_SPLITTER.split(block.decode("utf-8"))
-                    parts_end = len(parts) - 1
-                    for ptr, part in enumerate(parts):
-                        bytecount += len(part)
-                        if ptr == 0 and partial:
-                            part = partial + part
-                            partial = None
-                        if part != NEWLINE:
-                            reccount += 1
-                            if ptr == parts_end:
-                                partial = part
-                            elif rec_match := url_regex.match(part):
-                                pieces = rec_match.groupdict()
-                                page_info = json.loads(pieces['headers'])
-                                page_info.update(dict(filter(
-                                    lambda itm:itm[0] in OBSERVER_FIELDS,
-                                    pieces.items()
-                                )))
-                                del pieces
-                                if self.url_observer:
-                                    self.url_observer(page_info)
-                                # else:
-                                #     yield page_headers
-                            else:
-                                skip += 1
-                                if skip % 1000000 == 0:
-                                    logger.info("skipped %d records", skip)
-                self._send_progress(None, "Finished CDX scan of %s" % cdx,
-                                    False, new_pct)
+            try:
+                with gzip.GzipFile(fileobj=stream, mode="rb") as gunzipped:
+                    partial = None
+                    skip = 0
+                    self._send_progress(None, "Starting CDX scan of %s" % cdx,
+                                        False, 0.0)
+                    done = False
+                    # stream_iter = iter(lambda: gunzipped.read(2 ** 22), b'')
+                    # stream_iter = iter(lambda: gunzipped.read(2 ** 13), b'')
+                    stream_iter = gzip_reader(gunzipped, 2 ** 13)
+                    while not done:
+                        print("*" * 80, "\n  ",
+                              f"stream.tell: {stream.tell()}; "
+                              f"stream.length: {stream.length()}; "
+                              f"stream diff: {stream.length() - stream.tell()}; "
+                              f"gunzipped.tell: {gunzipped.tell()   }; "
+                              )
+                        if (block := next(stream_iter, None)) is None:
+                            done = True
+                            pu.db
+                            break
+                        if (new_pct := int(stream.tell() / stream.length() * 100)) > last_pct:
+                            last_pct = new_pct
+                            self._send_progress(cdx, "Scanning CDX",
+                                                False, last_pct)
+                        if not block:
+                            print("empty block ", "*" * 80)
+                        parts = LINE_SPLITTER.split(block.decode("utf-8"))
+                        parts_end = len(parts) - 1
+                        for ptr, part in enumerate(parts):
+                            bytecount += len(part)
+                            if ptr == 0 and partial:
+                                part = partial + part
+                                partial = None
+                            if part != NEWLINE:
+                                reccount += 1
+                                if ptr == parts_end:
+                                    partial = part
+                                elif rec_match := url_regex.match(part):
+                                    pieces = rec_match.groupdict()
+                                    page_info = json.loads(pieces['headers'])
+                                    page_info.update(dict(filter(
+                                        lambda itm:itm[0] in OBSERVER_FIELDS,
+                                        pieces.items()
+                                    )))
+                                    del pieces
+                                    if self.url_observer:
+                                        self.url_observer(page_info)
+                                else:
+                                    skip += 1
+                                    if skip % 1000000 == 0:
+                                        logger.info("skipped %d records", skip)
+                    self._send_progress(None, "Finished CDX scan of %s" % cdx,
+                                        False, new_pct)
+            except Exception as e:
+                from traceback import print_exc
+                print("#" * 120)
+                print_exc()
+                stream.close()
+                logger.error("\n\nError scanning CDX %s: %s\n\n", cdx, e)
 
     def _send_progress(self, cdx: Union[CdxFirstUrl, None],
                        status_msg: str,
@@ -449,7 +458,6 @@ class CCPageLocator:
                                    done,
                                    percent_done)
 
-
 class IndexStatus(CCIndexStatusObserver):
     def __call__(self,
                  crawl_label: str, status_msg: str,
@@ -459,18 +467,13 @@ class IndexStatus(CCIndexStatusObserver):
             f"{crawl_label}: {status_msg} ({indices_done}/{indices_total})"
             f"{' DONE' if index_complete else ''}")
 
-
 class CCPageDownloader:
     def __init__(self,
                  label: str,
                  page_locator: CCPageLocator,
-                 # url_observer: CCPageLocatorPageObserver,
-                 # progress_observer: CCPageLocatorProgressObserver,
                  ):
         self.crawl_label = label
         self.page_locator = page_locator
-        # self.url_observer = url_observer
-        # self.progress_observer = progress_observer
 
     def sum_downloads(self):
         for url_frag in self.page_locator.url_observer.warc:
@@ -479,7 +482,6 @@ class CCPageDownloader:
     def run(self):
         self.page_locator.run()
         self.page_locator.filter_cdx_by_url()
-
 
 class PageLocatorProgress(CCPageLocatorProgressObserver):
     def __call__(self,
@@ -491,13 +493,9 @@ class PageLocatorProgress(CCPageLocatorProgressObserver):
         print(f"{crawl_label}: {status_msg} ({cdx_num}) "
                 f"{percent_done}%{' - DONE' if index_complete else ''}")
 
-
-PIPELINE_SIZE = 48
-
 class PageLocatorObserver(CCPageLocatorPageObserver):
     def __init__(self, crawl_label):
         self.crawl_label = crawl_label
-
         self.warc = dd(int)
         self.doms = dd(int)
         self.queue = []
@@ -505,16 +503,9 @@ class PageLocatorObserver(CCPageLocatorPageObserver):
     def __call__(self, page_headers: Mapping) -> None:
         self.warc[page_headers['filename']] += 1
         self.doms[urlsplit(page_headers['url']).netloc] += 1
-        # print("Page Info: ", page_headers)
-        # self.queue.append(push_page_info.message(self.crawl_label, page_headers))
         push_page_info(self.crawl_label, page_headers)
-        # if len(self.queue) >= PIPELINE_SIZE:
-        #     pipeline([self.queue.pop() for _ in range(PIPELINE_SIZE)]).run()
-        #     print(f"Pipelined {PIPELINE_SIZE} messages")
 
-
-# @dramatiq.actor
-@backoff.on_exception(backoff.expo, BACKOFF_EXCEPTIONS,
+@backoff.on_exception(backoff.expo, HTTP_BACKOFF_EXCEPTIONS,
                       max_time=BACKOFF_MAX_TIME,
                       max_tries=BACKOFF_MAX_TRIES,
                       on_success=on_success_rpt,
@@ -531,8 +522,6 @@ def fetch_page_info(url: str, *args, **kw) -> Mapping:
     else:
         logger.warning(f"Failed to fetch %s", url)
 
-
-# @dramatiq.actor
 def write_page_info(crawl_label: str,
                     page_headers: Mapping,
                     warc_url: str,
@@ -542,12 +531,10 @@ def write_page_info(crawl_label: str,
     WarcResource.add(crawl=crawl,
                      page_url=page_headers['url'],
                      warc_url=warc_url,
-                     metadata=page_headers,
-                     length=int(warc_info['headers']['Content-Length']),
+                     page_metadata=json.dumps(page_headers),
+                     length=int(page_headers['length']),
                      )
 
-
-# @dramatiq.actor
 def push_page_info(crawl_label: str, page_headers: Mapping) -> None:
     warc_url = f"https://{CC_DATA_HOSTNAME}/{page_headers['filename']}"
     if WarcResource.exists(warc_url):
@@ -560,15 +547,6 @@ def push_page_info(crawl_label: str, page_headers: Mapping) -> None:
                     warc_info=warc_headers
                     )
 
-    # p = pipeline([
-    #     fetch_page_info.message(warc_url),
-    #     write_page_info.message(crawl_label, warc_url, page_headers),
-    # ]).run()
-    # while (result := p.get_result(block=True, timeout=60000)) and not result:
-    #     time.sleep(1)
-
-
-# @dramatiq.actor
 def runner(crawl_label,
            url_patterns: Union[Set[UrlPattern], List[UrlPattern]] = None,):
     indexer = CCIndexBuilder(
@@ -593,9 +571,6 @@ def runner(crawl_label,
         crawl_label,
         page_locator=page_locator)
     downloader.run()
-    # pu.db
-    if page_locator.url_observer.queue:
-        pipeline(page_locator.url_observer.queue).run()
 
     pl = page_locator
     logger.warning(f"%s: WARC urls: %d",
@@ -605,30 +580,17 @@ def runner(crawl_label,
 
     return page_locator
 
-
 if __name__ == '__main__':
-    # a = push_page_info(
-    #     {"url":"https://data.commoncrawl.org/crawl-data/CC-MAIN-2024-51/segments/1733066046748.1/warc/CC-MAIN-20241209152324-20241209182324-00392.warc.gz"}
-    # )
-    # print(a)
-    # exit(0)
-    # pu.db
     all_crawls = CCIndexOfCrawls(USER_AGENT).run()
     url_patterns = [
-        # UrlPattern('com', 'rottentomatoes', None, None, None, None),
+        # UrlPattern('com', 'gonze', None, None, None, None),
         # UrlPattern('com', 'alibaba', None, None, None, None),
-        UrlPattern('com', 'gonze', None, None, None, None),
         # UrlPattern('com', 'gsmarena', None, None, None, None),
-        # UrlPattern('com', 'nytimes', None, None, None, None),
+        # UrlPattern('gov', 'ftc', None, None, None, None),
+        UrlPattern('com', 'nytimes', None, None, None, None),
     ]
 
-    MAX_QUEUE = 24
-    qqq = []
-    # import pudb; pu.db
     for job_num, label in enumerate(all_crawls.keys()):
-        if not (crawl := Crawl.exists(label)):
+        if not Crawl.exists(label):
             crawl = Crawl.add(label, label)
         runner(crawl_label=label, url_patterns=url_patterns)
-        # p = pipeline([runner.message(crawl_label=label,
-        #                              url_patterns=url_patterns)])
-        # p.run()

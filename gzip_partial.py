@@ -7,8 +7,8 @@ import zlib
 import backoff
 from requests.sessions import Session
 
-from common import (BACKOFF_EXCEPTIONS, BACKOFF_MAX_TIME, BACKOFF_MAX_TRIES)
-from common import (on_backoff_rpt, on_success_rpt, on_giveup_rpt)
+from common_requests import HTTP_BACKOFF_EXCEPTIONS, BACKOFF_MAX_TIME, \
+    BACKOFF_MAX_TRIES, on_backoff_rpt, on_success_rpt, on_giveup_rpt
 
 
 def gzip_decompress_partial(data: bytes, max_length: int=sys.maxsize):
@@ -40,7 +40,7 @@ def gzip_decompress_partial(data: bytes, max_length: int=sys.maxsize):
         data = do.unused_data[8:].lstrip(b"\x00")
 
 
-@backoff.on_exception(backoff.expo, BACKOFF_EXCEPTIONS,
+@backoff.on_exception(backoff.expo, HTTP_BACKOFF_EXCEPTIONS,
                       max_time=BACKOFF_MAX_TIME,
                       max_tries=BACKOFF_MAX_TRIES,
                       on_success=on_success_rpt,

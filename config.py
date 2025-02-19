@@ -62,7 +62,7 @@ elif DB_TYPE == DbType.CLICKHOUSE:
     ),)
 
     TABLE_DEFAULTS_CdxFirstUrl = (engines.ReplacingMergeTree(
-        order_by=['crawl_id','cdx_num','tld', 'domain', 'subdomain', 'path'],
+        order_by=['crawl','cdx_num','tld', 'domain', 'subdomain', 'path'],
         index_granularity=8192,
     ),)
 
